@@ -127,3 +127,107 @@ class DetectionDecoder(nn.Module):
         logits = self.fc_cls(h).reshape(B, N, -1)
         boxes_cleaned = boxes_t + delta
         return boxes_cleaned, logits
+    
+
+# loss.py
+import torch, math
+import torch.nn.functional as F
+from torchvision.ops import box_convert, generalized_box_iou
+from scipy.optimize import linear_sum_assignment   # pip install scipy
+
+class HungarianSetCriterion(torch.nn.Module):
+    """
+    Implements the loss used in DiffusionDet / Sparse R-CNN
+    -------------------------------------------------------
+    Args
+        num_classes : int          (includes background class = 0)
+        lambda_cls  : float
+        lambda_l1   : float
+        lambda_giou : float
+        k_best      : int          (keep k matches per GT, paper uses 3)
+    """
+    def __init__(self, num_classes,lambda_cls=1.0,lambda_l1=5.0,lambda_giou=2.0, k_best=3):
+        super().__init__()
+        self.num_classes = num_classes
+        self.l_cls  = lambda_cls
+        self.l_l1   = lambda_l1
+        self.l_giou = lambda_giou
+        self.k_best = k_best
+
+    def forward(self, pred_boxes, pred_logits, gt_boxes, gt_labels):
+        """
+        pred_boxes : [B, N, 4]  (cx cy w h) in **same scale** as GT
+        pred_logits: [B, N, C]  (before softmax)
+        gt_boxes   : list[Tensor(M_i, 4)]  OR padded tensor [B, M_max, 4]
+        gt_labels  : list[Tensor(M_i)]     OR padded tensor [B, M_max]
+        returns    : scalar loss
+        """
+        if torch.is_tensor(gt_boxes):   # convert padded tensor → list
+            gt_boxes  = [b[torch.any(b!=0, dim=-1)] for b in gt_boxes]
+            gt_labels = [l[l!=-1]       for l in gt_labels]
+
+        B, N, _ = pred_boxes.shape
+        total_cls = total_l1 = total_giou = 0.0
+        total_gt = 0
+
+        for b in range(B):
+            pb = pred_boxes[b]                     # [N,4]
+            pl = pred_logits[b]                    # [N,C]
+            gb = gt_boxes[b].to(pb)                # [M,4]
+            gl = gt_labels[b].long().to(pb.device)        # [M]
+
+            M = gb.size(0)
+            if M == 0:     # no object → all preds should be background
+                total_cls += F.cross_entropy(pl, torch.zeros(N, dtype=torch.long, device=pb.device))
+                continue
+
+            # --------------- cost matrix N × M -------------------
+            cost_cls  = -pl[:, gl]                         # neg logit of GT class
+            cost_l1   = torch.cdist(pb, gb, p=1)
+            giou = generalized_box_iou(
+                     box_convert(pb, in_fmt='cxcywh', out_fmt='xyxy'),
+                     box_convert(gb, in_fmt='cxcywh', out_fmt='xyxy'))   # [N,M]
+            cost_giou = 1 - giou
+            C = (self.l_cls * cost_cls +
+                 self.l_l1  * cost_l1  +
+                 self.l_giou* cost_giou).detach().numpy()
+
+            # --------------- Hungarian assignment ----------------
+            idx_pred, idx_gt = linear_sum_assignment(C)
+            # keep top-k matches per GT
+            matched = [[] for _ in range(M)]
+            for p,g in zip(idx_pred, idx_gt):
+                matched[g].append(p)
+            idx_pred_final, idx_gt_final = [], []
+            for g, plist in enumerate(matched):
+                for p in plist[: self.k_best]:
+                    idx_pred_final.append(p)
+                    idx_gt_final.append(g)
+            if len(idx_pred_final) == 0:
+                continue
+            idx_pred_final = torch.tensor(idx_pred_final, device=pb.device)
+            idx_gt_final   = torch.tensor(idx_gt_final,   device=pb.device)
+
+            # --------------- losses ------------------------------
+            pb_m  = pb[idx_pred_final]
+            gb_m  = gb[idx_gt_final]
+            loss_l1   = F.l1_loss(pb_m, gb_m, reduction='sum')
+
+            giou_m = generalized_box_iou(
+                        box_convert(pb_m, in_fmt='cxcywh', out_fmt='xyxy'),
+                        box_convert(gb_m, in_fmt='cxcywh', out_fmt='xyxy'))
+            loss_giou = (1 - giou_m.diag()).sum()
+
+            cls_tgt = torch.zeros_like(pl)
+            cls_tgt[range(N), 0] = 1.0              # background
+            cls_tgt[idx_pred_final, 0] = 0.0
+            cls_tgt[idx_pred_final, gl[idx_gt_final]] = 1.0
+            loss_cls = F.cross_entropy(pl, cls_tgt.argmax(dim=-1), reduction='sum')
+
+            total_cls  += loss_cls
+            total_l1   += loss_l1
+            total_giou += loss_giou
+            total_gt   += M
+
+        norm = max(total_gt, 1)
+        return (self.l_cls*total_cls + self.l_l1*total_l1 + self.l_giou*total_giou) / norm
