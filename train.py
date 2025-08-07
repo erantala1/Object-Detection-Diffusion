@@ -7,6 +7,7 @@ from model import *
 from torchvision.datasets import CocoDetection
 from torchvision import transforms
 from torch.utils.data import DataLoader
+import wandb
 
 
 
@@ -79,8 +80,8 @@ def train_loss(images, gt_boxes, gt_labels):
     t = torch.randint(0, T, (B,), device=device)
     pb_crpt = diffusion.forward_process(pb,t)
     pb_pred, logits = decode(pb_crpt, feats, t)
-    loss = criterion(pb_pred, logits, gt_boxes, gt_labels) 
-    return loss
+    loss, loss_dict = criterion(pb_pred, logits, gt_boxes, gt_labels) 
+    return loss, loss_dict
 
 if __name__=="__main__":
     T = 1000
@@ -91,14 +92,28 @@ if __name__=="__main__":
     diffusion = Diffusion(T,device).to(device)
     encode = ImageEncoder(device, trainable = False, weights = True, norm_layer = nn.BatchNorm2d).to(device)
     decode = DetectionDecoder(num_classes, device, roi_size, hidden_dim).to(device)
-    criterion = HungarianSetCriterion(num_classes=81,lambda_cls=1.0,lambda_l1=5.0,lambda_giou=2.0,k_best=3).to(device)
-    learning_rate = 1e-5
+    criterion = HungarianSetCriterion(num_classes,lambda_cls=1.0,lambda_l1=5.0,lambda_giou=2.0,k_best=3).to(device)
+    learning_rate = 2.5 * 1e-5
     loss_fn = torch.nn.MSELoss()
     optimizer = torch.optim.AdamW(decode.parameters(), lr = learning_rate)
     scale = 2.0 #adjust
     N = 300 #proposal boxes
     epochs = 50
-
+    run = wandb.init(
+        # Set the wandb entity where your project will be logged (generally your team name).
+        entity="evan-rantala-university-of-california",
+        # Set the wandb project where this run will be logged.
+        project="Diffusion Object Detection",
+        # Track hyperparameters and run metadata.
+        config={
+            "learning_rate": 2.5 * 1e-5,
+            "architecture": "DiffusionDet",
+            "dataset": "COCO2017",
+            "N_train": 300,
+            "Hidden Dimension": 256,
+            "epochs": 50,
+        },
+    )
 
     ROOT = "/Users/evanrantala/Downloads/COCO/coco2017"
     TRAIN_IMG_DIR = os.path.join(ROOT, "train2017")
@@ -118,19 +133,45 @@ if __name__=="__main__":
     val_ds, batch_size=16, shuffle=False,
     num_workers=4, collate_fn=collate, pin_memory=True)
 
+    ckpt_dir = ".checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    best_loss = float('inf')
 
+    global_step = 0
     for ep in range(epochs):
         running_loss = 0.0
         for images, gt_boxes, gt_labels in train_loader:
             images = images.to(device)
             gt_boxes = gt_boxes.to(device)
             optimizer.zero_grad()
-            loss = train_loss(images, gt_boxes, gt_labels)
+            loss, loss_dict = train_loss(images, gt_boxes, gt_labels)
             print(loss)
             loss.backward()
             optimizer.step()
-            running_loss += loss.detach().item()
-        net_loss = (running_loss/(len(train_loader)))
+            run.log({
+                "batch/loss_total": loss.item(),
+                "batch/loss_cls":   loss_dict["cls"],
+                "batch/loss_l1":    loss_dict["l1"],
+                "batch/loss_giou":  loss_dict["giou"],
+            }, step=global_step)
+
+            global_step += 1
+            running_loss += loss.item()
+        epoch_loss = (running_loss/(len(train_loader)))
         print(f"epoch:{ep}, running_loss = {running_loss}")
-        print(f"epoch:{ep}, net_loss = {net_loss}")
-    torch.save(decode.state_dict(), "decoder.pth")
+        print(f"epoch:{ep}, epoch_loss = {epoch_loss}")
+        run.log({"epoch_loss":epoch_loss},step=ep)
+        ckpt = {
+        "epoch": ep,
+        "decoder": decode.state_dict(),
+        "encoder": encode.state_dict(),
+        "diffusion": diffusion.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch_loss": epoch_loss,
+        }
+        torch.save(ckpt, os.path.join(ckpt_dir, "last.pth"))
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            torch.save(ckpt, os.path.join(ckpt_dir, "best.pth"))
+    print("Training Done")
+    run.finish()
