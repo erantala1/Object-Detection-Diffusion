@@ -213,4 +213,5 @@ class HungarianSetCriterion(torch.nn.Module):
             total_gt   += M
 
         norm = max(total_gt, 1)
-        return (self.l_cls*total_cls + self.l_l1*total_l1 + self.l_giou*total_giou) / norm
+        total = (self.l_cls*total_cls + self.l_l1*total_l1 + self.l_giou*total_giou) / norm
+        return total, {"cls": total_cls / norm, "l1":  total_l1  / norm, "giou":total_giou/ norm}
