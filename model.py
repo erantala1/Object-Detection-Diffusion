@@ -176,7 +176,7 @@ class HungarianSetCriterion(torch.nn.Module):
             cost_giou = 1 - giou
             C = (self.l_cls * cost_cls +
                  self.l_l1  * cost_l1  +
-                 self.l_giou* cost_giou).detach().numpy()
+                 self.l_giou* cost_giou).cpu().detach().numpy()
 
             idx_pred, idx_gt = linear_sum_assignment(C)
             matched = [[] for _ in range(M)]
