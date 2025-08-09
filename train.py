@@ -85,7 +85,7 @@ def train_loss(images, gt_boxes, gt_labels):
 
 if __name__=="__main__":
     T = 1000
-    device = 'cpu' #change to cude if available
+    device = 'cuda' #change to cude if available
     num_classes = 91
     roi_size = 7
     hidden_dim = 256
@@ -114,8 +114,12 @@ if __name__=="__main__":
             "epochs": 50,
         },
     )
+    wandb.define_metric("global_step")
+    wandb.define_metric("batch/*", step_metric="global_step")
+    wandb.define_metric("epoch")
+    wandb.define_metric("epoch/*", step_metric="epoch")
 
-    ROOT = "/Users/evanrantala/Downloads/COCO/coco2017"
+    ROOT = "./data"
     TRAIN_IMG_DIR = os.path.join(ROOT, "train2017")
     VAL_IMG_DIR   = os.path.join(ROOT, "val2017")
     TRAIN_ANN = os.path.join(ROOT, "annotations", "instances_train2017.json")
@@ -137,8 +141,19 @@ if __name__=="__main__":
     os.makedirs(ckpt_dir, exist_ok=True)
     best_loss = float('inf')
 
+    ckpt_path = os.path.join(ckpt_dir,"last.pth")
+    if os.path.isfile(ckpt_path):
+        ckpt = torch.load(ckpt_path,map_location=device)
+        decode.load_state_dict(ckpt["decoder"])
+        encode.load_state_dict(ckpt["encoder"])
+        diffusion.load_state_dict(ckpt["diffusion"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt.get("epoch",-1) + 1
+        best_loss = ckpt.get("epoch_loss", float("inf"))
+        #global_step = ckpt.get("global_step")
+
     global_step = 0
-    for ep in range(epochs):
+    for ep in range(start_epoch,epochs):
         running_loss = 0.0
         for images, gt_boxes, gt_labels in train_loader:
             images = images.to(device)
@@ -149,18 +164,22 @@ if __name__=="__main__":
             loss.backward()
             optimizer.step()
             run.log({
+                "global_step": global_step,
                 "batch/loss_total": loss.item(),
                 "batch/loss_cls":   loss_dict["cls"],
                 "batch/loss_l1":    loss_dict["l1"],
                 "batch/loss_giou":  loss_dict["giou"],
-            }, step=global_step)
+            })
 
             global_step += 1
             running_loss += loss.item()
         epoch_loss = (running_loss/(len(train_loader)))
         print(f"epoch:{ep}, running_loss = {running_loss}")
         print(f"epoch:{ep}, epoch_loss = {epoch_loss}")
-        run.log({"epoch_loss":epoch_loss},step=ep)
+        run.log({
+        "epoch": ep,
+        "epoch/loss": epoch_loss,
+        })
         ckpt = {
         "epoch": ep,
         "decoder": decode.state_dict(),
@@ -168,6 +187,7 @@ if __name__=="__main__":
         "diffusion": diffusion.state_dict(),
         "optimizer": optimizer.state_dict(),
         "epoch_loss": epoch_loss,
+        "global_step": global_step
         }
         torch.save(ckpt, os.path.join(ckpt_dir, "last.pth"))
         if epoch_loss < best_loss:
