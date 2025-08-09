@@ -21,9 +21,11 @@ def collate(batch):
         labels = []
         for obj in anns:
             x, y, w, h = obj["bbox"]
-            cx, cy = x + w/2, y + h/2
-            boxes.append([cx, cy, w, h])
-            labels.append(obj["category_id"])
+            # Ensure boxes are valid (positive dimensions)
+            if w > 0 and h > 0:
+                cx, cy = x + w/2, y + h/2
+                boxes.append([cx, cy, w, h])
+                labels.append(obj["category_id"])
 
         if not boxes:
             boxes.append([0., 0., 0., 0.])
@@ -51,11 +53,6 @@ def collate(batch):
     return padded_imgs, padded_boxes, padded_labels
 
 
-def set_prediction_loss(prediction, gt_boxes, loss_fn):
-    gt = pad_boxes(prediction.shape[1],gt_boxes)
-    return loss_fn(prediction,gt)
-
-
 #add random boxes to ground truth images so that each image has N boxes
 def pad_boxes(N, gt_boxes):
     B, M, _ = gt_boxes.shape
@@ -72,7 +69,7 @@ def pad_boxes(N, gt_boxes):
     padded = torch.cat([gt_boxes, extra], dim=1)
     return padded
 
-def train_loss(images, gt_boxes, gt_labels):
+def train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device):
     B = images.size(0)
     feats = encode(images)
     pb = pad_boxes(N, gt_boxes)
@@ -85,17 +82,28 @@ def train_loss(images, gt_boxes, gt_labels):
 
 if __name__=="__main__":
     T = 1000
-    device = 'cuda' #change to cude if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = device.type == 'cuda'  # Use mixed precision only on CUDA
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     num_classes = 91
     roi_size = 7
     hidden_dim = 256
     diffusion = Diffusion(T,device).to(device)
     encode = ImageEncoder(device, trainable = False, weights = True, norm_layer = nn.BatchNorm2d).to(device)
     decode = DetectionDecoder(num_classes, device, roi_size, hidden_dim).to(device)
+    
+    # Set models to appropriate modes
+    encode.eval()  # Encoder should always be in eval mode since it's frozen
+    diffusion.eval()  # Diffusion model should be in eval mode during training
+    decode.train()  # Only decoder should be in train mode
+    
     criterion = HungarianSetCriterion(num_classes,lambda_cls=1.0,lambda_l1=5.0,lambda_giou=2.0,k_best=3).to(device)
     learning_rate = 2.5 * 1e-5
-    loss_fn = torch.nn.MSELoss()
     optimizer = torch.optim.AdamW(decode.parameters(), lr = learning_rate)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    
+    # Add warmup scheduler
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
     scale = 2.0 #adjust
     N = 300 #proposal boxes
     epochs = 50
@@ -119,15 +127,23 @@ if __name__=="__main__":
     wandb.define_metric("epoch")
     wandb.define_metric("epoch/*", step_metric="epoch")
 
-    ROOT = "./data"
+    ROOT = "/Users/evanrantala/Downloads/COCO/coco2017"
     TRAIN_IMG_DIR = os.path.join(ROOT, "train2017")
     VAL_IMG_DIR   = os.path.join(ROOT, "val2017")
     TRAIN_ANN = os.path.join(ROOT, "annotations", "instances_train2017.json")
     VAL_ANN   = os.path.join(ROOT, "annotations", "instances_val2017.json")
 
     to_tensor = transforms.ToTensor()
-    train_ds = CocoDetection(TRAIN_IMG_DIR, TRAIN_ANN, transform=to_tensor)
-    val_ds   = CocoDetection(VAL_IMG_DIR,   VAL_ANN,   transform=to_tensor)
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomResizedCrop(size=(640, 640), scale=(0.8, 1.0), ratio=(0.75, 1.33))
+    ])
+    val_transform = transforms.ToTensor()
+    
+    train_ds = CocoDetection(TRAIN_IMG_DIR, TRAIN_ANN, transform=train_transform)
+    val_ds   = CocoDetection(VAL_IMG_DIR,   VAL_ANN,   transform=val_transform)
 
     train_loader = DataLoader(
     train_ds, batch_size=16, shuffle=True,
@@ -140,7 +156,9 @@ if __name__=="__main__":
     ckpt_dir = ".checkpoints"
     os.makedirs(ckpt_dir, exist_ok=True)
     best_loss = float('inf')
-
+    patience = 10
+    patience_counter = 0
+    '''
     ckpt_path = os.path.join(ckpt_dir,"last.pth")
     if os.path.isfile(ckpt_path):
         ckpt = torch.load(ckpt_path,map_location=device)
@@ -148,50 +166,151 @@ if __name__=="__main__":
         encode.load_state_dict(ckpt["encoder"])
         diffusion.load_state_dict(ckpt["diffusion"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("warmup_scheduler"):
+            warmup_scheduler.load_state_dict(ckpt["warmup_scheduler"])
+        if scaler and ckpt.get("scaler"):
+            scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch",-1) + 1
         best_loss = ckpt.get("epoch_loss", float("inf"))
-        #global_step = ckpt.get("global_step")
-
+        global_step = ckpt.get("global_step")
+    '''
+    start_epoch = 0
     global_step = 0
     for ep in range(start_epoch,epochs):
+        print(f"Starting epoch {ep+1}/{epochs}")
         running_loss = 0.0
+        num_batches = 0
         for images, gt_boxes, gt_labels in train_loader:
             images = images.to(device)
             gt_boxes = gt_boxes.to(device)
+            gt_labels = gt_labels.to(device)
+            
+            # Validate data
+            if torch.isnan(images).any() or torch.isnan(gt_boxes).any():
+                print("Warning: NaN detected in input data, skipping batch")
+                continue
+                
             optimizer.zero_grad()
-            loss, loss_dict = train_loss(images, gt_boxes, gt_labels)
+            
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    loss, loss_dict = train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device)
+            else:
+                loss, loss_dict = train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device)
+                
             print(loss)
-            loss.backward()
-            optimizer.step()
+            
+            if use_amp:
+                scaler.scale(loss).backward()
+                # Add gradient clipping for stability
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(decode.parameters(), max_norm=1.0)
+                
+                # Log gradient norms for debugging
+                total_norm = 0
+                for p in decode.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                # Add gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(decode.parameters(), max_norm=1.0)
+                
+                # Log gradient norms for debugging
+                total_norm = 0
+                for p in decode.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** (1. / 2)
+                
+                optimizer.step()
             run.log({
                 "global_step": global_step,
                 "batch/loss_total": loss.item(),
                 "batch/loss_cls":   loss_dict["cls"],
                 "batch/loss_l1":    loss_dict["l1"],
                 "batch/loss_giou":  loss_dict["giou"],
+                "batch/learning_rate": optimizer.param_groups[0]['lr'],
+                "batch/gradient_norm": total_norm,
             })
 
             global_step += 1
             running_loss += loss.item()
-        epoch_loss = (running_loss/(len(train_loader)))
+            num_batches += 1
+            
+            # Apply warmup scheduler for first 5 epochs
+            if ep < 5:
+                warmup_scheduler.step()
+        epoch_loss = (running_loss/num_batches)
         print(f"epoch:{ep}, running_loss = {running_loss}")
         print(f"epoch:{ep}, epoch_loss = {epoch_loss}")
         run.log({
         "epoch": ep,
         "epoch/loss": epoch_loss,
         })
-        ckpt = {
-        "epoch": ep,
-        "decoder": decode.state_dict(),
-        "encoder": encode.state_dict(),
-        "diffusion": diffusion.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "epoch_loss": epoch_loss,
-        "global_step": global_step
-        }
-        torch.save(ckpt, os.path.join(ckpt_dir, "last.pth"))
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            torch.save(ckpt, os.path.join(ckpt_dir, "best.pth"))
+        # Save checkpoint every 5 epochs or if it's the best so far
+        if (ep + 1) % 5 == 0 or epoch_loss < best_loss:
+            ckpt = {
+            "epoch": ep,
+            "decoder": decode.state_dict(),
+            "encoder": encode.state_dict(),
+            "diffusion": diffusion.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "warmup_scheduler": warmup_scheduler.state_dict(),
+            "scaler": scaler.state_dict() if scaler else None,
+            "epoch_loss": epoch_loss,
+            "global_step": global_step
+            }
+            torch.save(ckpt, os.path.join(ckpt_dir, "last.pth"))
+            if epoch_loss < best_loss:
+                best_loss = epoch_loss
+                torch.save(ckpt, os.path.join(ckpt_dir, "best.pth"))
+                patience_counter = 0
+            else:
+                patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {patience} epochs without improvement")
+            break
+        
+        # Validation loop
+        decode.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for images, gt_boxes, gt_labels in val_loader:
+                images = images.to(device)
+                gt_boxes = gt_boxes.to(device)
+                gt_labels = gt_labels.to(device)
+                
+                # Validate data
+                if torch.isnan(images).any() or torch.isnan(gt_boxes).any():
+                    print("Warning: NaN detected in validation data, skipping batch")
+                    continue
+                    
+                loss, loss_dict = train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device)
+                val_loss += loss.item()
+        
+        val_loss = val_loss / len(val_loader)
+        print(f"epoch:{ep}, val_loss = {val_loss}")
+        run.log({
+            "epoch": ep,
+            "epoch/loss": epoch_loss,
+            "epoch/val_loss": val_loss,
+            "epoch/learning_rate": scheduler.get_last_lr()[0],
+        })
+        decode.train()
+        
+        # Update learning rate
+        scheduler.step()
+        
     print("Training Done")
     run.finish()
