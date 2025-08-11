@@ -82,6 +82,7 @@ class DetectionDecoder(nn.Module):
         )
         self.apply(self._init_weights)
         self.to(device)
+        self.signal_scale = 2.0
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -110,10 +111,22 @@ class DetectionDecoder(nn.Module):
 
     def forward(self, boxes_t, feats, t):
         B, N, _ = boxes_t.shape
-        boxes_xyxy = self.center_to_corner(boxes_t)
-        boxes_list = [boxes_xyxy[i] for i in range(B)]
+        boxes_norm = (boxes_t / 2.0).div(self.signal_scale).add(0.5) if hasattr(self, "signal_scale") else (boxes_t/2 + 0.5)
         _, _, H_pad, W_pad = next(iter(feats.values())).shape
         H_img, W_img = H_pad * 4, W_pad * 4
+        boxes_xyxy = self.center_to_corner(boxes_norm)
+        boxes_xyxy[..., [0, 2]] *= W_img
+        boxes_xyxy[..., [1, 3]] *= H_img
+
+        eps = 1e-6
+        x1, y1, x2, y2 = boxes_xyxy.unbind(-1)
+        x1 = x1.clamp(0, W_img-1); y1 = y1.clamp(0, H_img-1)
+        x2 = x2.clamp(0, W_img-1); y2 = y2.clamp(0, H_img-1)
+        x1 = torch.minimum(x1, x2 - eps); y1 = torch.minimum(y1, y2 - eps)
+        x2 = torch.maximum(x2, x1 + eps); y2 = torch.maximum(y2, y1 + eps)
+        boxes_xyxy = torch.stack((x1,y1,x2,y2), dim=-1)
+
+        boxes_list = [boxes_xyxy[i] for i in range(B)]
         crops = self.roi_align(feats, boxes_list, [(H_img, W_img)] * B)
 
         feats_flat = crops.flatten(1)

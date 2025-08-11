@@ -70,14 +70,29 @@ def pad_boxes(N, gt_boxes):
     return padded
 
 def train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device):
-    B = images.size(0)
+    B, _, H_img, W_img = images.shape
     feats = encode(images)
-    pb = pad_boxes(N, gt_boxes)
-    pb = (pb * 2 - 1) * scale
+    gt_norm = gt_boxes.clone()
+    gt_norm[..., 0] /= W_img   # cx
+    gt_norm[..., 2] /= W_img   # w
+    gt_norm[..., 1] /= H_img   # cy
+    gt_norm[..., 3] /= H_img   # h
+    pb = pad_boxes(N, gt_norm)
+    pb_scaled = (pb * 2 - 1) * scale
+
     t = torch.randint(0, T, (B,), device=device)
-    pb_crpt = diffusion.forward_process(pb,t)
-    pb_pred, logits = decode(pb_crpt, feats, t)
-    loss, loss_dict = criterion(pb_pred, logits, gt_boxes, gt_labels) 
+    pb_crpt = diffusion.forward_process(pb_scaled, t)
+    pb_pred_scaled, logits = decode(pb_crpt, feats, t)
+
+    pb_pred_norm = (pb_pred_scaled / scale + 1) / 2
+
+    pb_pred_px = pb_pred_norm.clone()
+    pb_pred_px[..., 0] *= W_img
+    pb_pred_px[..., 2] *= W_img
+    pb_pred_px[..., 1] *= H_img
+    pb_pred_px[..., 3] *= H_img
+
+    loss, loss_dict = criterion(pb_pred_px, logits, gt_boxes, gt_labels)
     return loss, loss_dict
 
 if __name__=="__main__":
