@@ -151,9 +151,9 @@ if __name__=="__main__":
     to_tensor = transforms.ToTensor()
     train_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        transforms.RandomResizedCrop(size=(640, 640), scale=(0.8, 1.0), ratio=(0.75, 1.33))
+        #transforms.RandomHorizontalFlip(p=0.5),
+        #transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        #transforms.RandomResizedCrop(size=(640, 640), scale=(0.8, 1.0), ratio=(0.75, 1.33))
     ])
     val_transform = transforms.ToTensor()
     
