@@ -7,6 +7,29 @@ from torchvision.models.detection.backbone_utils import resnet_fpn_backbone
 import torch.nn.functional as F
 from torchvision.ops import box_convert, generalized_box_iou
 from scipy.optimize import linear_sum_assignment
+from torchvision.ops import sigmoid_focal_loss
+import torchvision.ops as ops
+
+def logits_to_probs(logits, use_focal=True):
+    # DiffusionDet uses sigmoid multi-label form (no background column)
+    return torch.sigmoid(logits) if use_focal else torch.softmax(logits, dim=-1)
+
+def cxcywh_to_xyxy(boxes):
+    cx, cy, w, h = boxes.unbind(-1)
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+def clamp_xyxy(xyxy, H, W, eps=1e-6):
+    x1, y1, x2, y2 = xyxy.unbind(-1)
+    x1 = x1.clamp(0, W-1); y1 = y1.clamp(0, H-1)
+    x2 = x2.clamp(0, W-1); y2 = y2.clamp(0, H-1)
+    x1 = torch.minimum(x1, x2 - eps); y1 = torch.minimum(y1, y2 - eps)
+    x2 = torch.maximum(x2, x1 + eps); y2 = torch.maximum(y2, y1 + eps)
+    return torch.stack([x1,y1,x2,y2], dim=-1)
+
 
 class Diffusion(nn.Module):
     def __init__(self,T,device):
@@ -69,7 +92,7 @@ class DetectionDecoder(nn.Module):
             featmap_names=['0','1','2','3'], output_size=roi_size, sampling_ratio=2)
         in_dim = 256 * roi_size * roi_size
         self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.ReLU(inplace=False)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 
         self.fc_reg  = nn.Linear(hidden_dim, 4)
@@ -78,7 +101,7 @@ class DetectionDecoder(nn.Module):
         self.t_dim = 128
         self.t_embed_proj = nn.Sequential(
             nn.Linear(self.t_dim, hidden_dim),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=False)
         )
         self.apply(self._init_weights)
         self.to(device)
@@ -111,7 +134,7 @@ class DetectionDecoder(nn.Module):
 
     def forward(self, boxes_t, feats, t):
         B, N, _ = boxes_t.shape
-        boxes_norm = (boxes_t / 2.0).div(self.signal_scale).add(0.5) if hasattr(self, "signal_scale") else (boxes_t/2 + 0.5)
+        boxes_norm = (boxes_t / self.signal_scale + 1.0) / 2.0  # in [0,1]
         _, _, H_pad, W_pad = next(iter(feats.values())).shape
         H_img, W_img = H_pad * 4, W_pad * 4
         boxes_xyxy = self.center_to_corner(boxes_norm)
@@ -140,7 +163,16 @@ class DetectionDecoder(nn.Module):
         h = self.act(self.fc2(h))
         delta  = self.fc_reg(h).reshape(B, N, 4)
         logits = self.fc_cls(h).reshape(B, N, -1)
-        boxes_cleaned = boxes_t + delta
+
+        cx, cy, w_, h_ = boxes_t.unbind(-1)
+        dx, dy, dlogw, dlogh = delta.unbind(-1)
+
+        cx_new = cx + dx
+        cy_new = cy + dy
+        w_new  = (w_.clamp_min(1e-6)) * torch.exp(dlogw.clamp(-4, 4))
+        h_new  = (h_.clamp_min(1e-6)) * torch.exp(dlogh.clamp(-4, 4))
+        boxes_cleaned = torch.stack([cx_new, cy_new, w_new, h_new], dim=-1)
+
         return boxes_cleaned, logits
     
 
@@ -228,3 +260,160 @@ class HungarianSetCriterion(torch.nn.Module):
         norm = max(total_gt, 1)
         total = (self.l_cls*total_cls + self.l_l1*total_l1 + self.l_giou*total_giou) / norm
         return total, {"cls": total_cls / norm, "l1":  total_l1  / norm, "giou":total_giou/ norm}
+
+class MatcherDynamicK(torch.nn.Module):
+    def __init__(self, cost_class=1.0, cost_bbox=5.0, cost_giou=2.0, use_focal=True, ota_k=10):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox  = cost_bbox
+        self.cost_giou  = cost_giou
+        self.use_focal  = use_focal
+        self.ota_k      = ota_k
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """
+        outputs: {'pred_logits':[B,N,C], 'pred_boxes':[B,N,4] (xyxy px)}
+        targets: list of dicts:
+          {'labels':[Mi], 'boxes':[Mi,4] cxcywh norm, 'boxes_xyxy':[Mi,4] xyxy px,
+           'image_size_xyxy':[4], 'image_size_xyxy_tgt':[4]}
+        returns: indices: list of tuples (selected_query_mask [N], gt_indices [K])
+        """
+        B, N, C = outputs["pred_logits"].shape
+        probs   = logits_to_probs(outputs["pred_logits"], use_focal=self.use_focal)
+        pred_xyxy = outputs["pred_boxes"]
+
+        indices = []
+        for b in range(B):
+            p_xyxy = pred_xyxy[b]                  # [N,4] px
+            p_prob = probs[b]                      # [N,C]
+            tgt    = targets[b]
+            gt_ids = tgt["labels"]                 # [M]
+            M = gt_ids.numel()
+            if M == 0:
+                sel = torch.zeros(N, dtype=torch.bool, device=p_prob.device)
+                indices.append((sel, torch.arange(0, device=p_prob.device)))
+                continue
+
+            gt_xyxy = tgt["boxes_xyxy"]            # [M,4] px
+            # classification cost
+            if self.use_focal:
+                alpha, gamma = 0.25, 2.0
+                pos = p_prob[:, gt_ids]
+                neg = 1.0 - pos
+                cost_class = ( alpha * (neg**gamma) * (-(pos+1e-8).log())
+                               - (1-alpha) * (pos**gamma) * (-(neg+1e-8).log()) )
+            else:
+                cost_class = -p_prob[:, gt_ids]
+
+            # bbox L1 cost (normalized)
+            img_wh = tgt["image_size_xyxy"]  # [4] = [W,H,W,H]
+            p_xyxy_n = p_xyxy / img_wh
+            g_xyxy_n = gt_xyxy / tgt["image_size_xyxy_tgt"]
+            cost_bbox = torch.cdist(p_xyxy_n, g_xyxy_n, p=1)
+
+            # giou cost (absolute)
+            giou = ops.generalized_box_iou(p_xyxy, gt_xyxy)  # [N,M]
+            cost_giou = 1.0 - giou
+
+            cost = self.cost_class*cost_class + self.cost_bbox*cost_bbox + self.cost_giou*cost_giou  # [N,M]
+
+            # simOTA dynamic-K
+            with torch.no_grad():
+                pair_ious = ops.box_iou(p_xyxy, gt_xyxy)     # IoU [N,M]
+                topk = min(self.ota_k, max(1, N))
+                topk_ious, _ = torch.topk(pair_ious, k=topk, dim=0)   # [topk, M]
+                dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)  # [M]
+
+            matching_matrix = torch.zeros_like(cost)
+            for j in range(M):
+                _, pos_idx = torch.topk(cost[:, j], k=dynamic_ks[j].item(), largest=False)
+                matching_matrix[pos_idx, j] = 1.0
+
+            # ensure one-to-many but at least one per GT
+            anchor_match_gt = matching_matrix.sum(1)
+            if (anchor_match_gt > 1).any():
+                multi = anchor_match_gt > 1
+                min_cost_idx = cost[multi].argmin(dim=1)
+                matching_matrix[multi] *= 0
+                matching_matrix[multi, min_cost_idx] = 1
+
+            # if any GT unmatched, force best
+            while (matching_matrix.sum(0) == 0).any():
+                un = (matching_matrix.sum(0) == 0).nonzero(as_tuple=False).squeeze(1)
+                for j in un:
+                    p = torch.argmin(cost[:, j])
+                    matching_matrix[:, j] *= 0
+                    matching_matrix[p, j] = 1
+
+            selected_query = matching_matrix.sum(1) > 0
+            gt_indices     = matching_matrix[selected_query].argmax(dim=1)
+            indices.append((selected_query, gt_indices))
+        return indices, None
+
+
+class SetCriterionDynamicKLite(torch.nn.Module):
+    def __init__(self, num_classes, matcher, weight_dict, use_focal=True):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher     = matcher
+        self.weight_dict = weight_dict
+        self.use_focal   = use_focal
+
+    def forward(self, outputs, targets):
+        """
+        outputs: {'pred_logits':[B,N,C], 'pred_boxes':[B,N,4] xyxy px}
+        targets: list of dicts (see above)
+        returns: dict of losses
+        """
+        B, N, C = outputs["pred_logits"].shape
+        indices, _ = self.matcher(outputs, targets)
+
+        # --- classification loss (focal) ---
+        logits = outputs["pred_logits"]        # [B,N,C]
+        probs  = logits_to_probs(logits, use_focal=self.use_focal)
+
+        loss_ce_sum = torch.tensor(0., device=logits.device)
+        num_pos = 0
+        for b in range(B):
+            sel, gt_idx = indices[b]          # sel:[N] bool, gt_idx:[K]
+            if gt_idx.numel() == 0:
+                continue
+            tgt_cls = targets[b]["labels"][gt_idx]     # [K] long in [0..C-1]
+            pred_k  = logits[b][sel]                   # [K,C]
+            # focal on positive class positions only (one-hot)
+            onehot = torch.zeros_like(pred_k)
+            onehot[torch.arange(tgt_cls.numel(), device=logits.device), tgt_cls] = 1.0
+            loss_ce = sigmoid_focal_loss(pred_k, onehot, reduction="sum")
+            loss_ce_sum += loss_ce
+            num_pos += tgt_cls.numel()
+        loss_ce = loss_ce_sum / max(num_pos, 1)
+
+        # --- box losses ---
+        loss_l1_sum = torch.tensor(0., device=logits.device)
+        loss_gi_sum = torch.tensor(0., device=logits.device)
+        for b in range(B):
+            sel, gt_idx = indices[b]
+            if gt_idx.numel() == 0:
+                continue
+            p_xyxy = outputs["pred_boxes"][b][sel]           # [K,4] px
+            g_xyxy = targets[b]["boxes_xyxy"][gt_idx]        # [K,4] px
+
+            # normalized L1 on xyxy (like paper)
+            wh_out = targets[b]["image_size_xyxy"]           # [W,H,W,H]
+            wh_tgt = targets[b]["image_size_xyxy_tgt"]
+            p_n = p_xyxy / wh_out
+            g_n = g_xyxy / wh_tgt
+            loss_l1_sum += F.l1_loss(p_n, g_n, reduction='sum')
+
+            giou = ops.generalized_box_iou(p_xyxy, g_xyxy)   # [K,K]
+            loss_gi_sum += (1.0 - giou.diag()).sum()
+
+        num_pos = max(num_pos, 1)
+        losses = {
+            "loss_ce":   loss_ce,
+            "loss_bbox": loss_l1_sum / num_pos,
+            "loss_giou": loss_gi_sum / num_pos,
+        }
+        # total (weighted) is computed in train loop
+        return losses
