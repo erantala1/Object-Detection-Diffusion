@@ -99,7 +99,8 @@ def train_loss(images, gt_boxes, gt_labels, sizes, diffusion, encode, decode, cr
 
 
 if __name__=="__main__":
-    ROOT = "./data"
+    ROOT = "/Users/evanrantala/Downloads/COCO/coco2017"
+    #ROOT = "./data"
     TRAIN_IMG_DIR = os.path.join(ROOT, "train2017")
     VAL_IMG_DIR   = os.path.join(ROOT, "val2017")
     TRAIN_ANN = os.path.join(ROOT, "annotations", "instances_train2017.json")
@@ -107,10 +108,10 @@ if __name__=="__main__":
 
     to_tensor = transforms.ToTensor()
     train_transform = transforms.Compose([
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomApply([transforms.GaussianBlur(kernel_size=5)], p=0.2),
+        transforms.RandomGrayscale(p=0.05),
         transforms.ToTensor(),
-        #transforms.RandomHorizontalFlip(p=0.5),
-        #transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-        #transforms.RandomResizedCrop(size=(640, 640), scale=(0.8, 1.0), ratio=(0.75, 1.33))
     ])
     val_transform = transforms.ToTensor()
     
@@ -169,7 +170,7 @@ if __name__=="__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    num_classes = 91
+    num_classes = 80
     roi_size = 7
     hidden_dim = 256
     diffusion = Diffusion(T,device).to(device)
@@ -204,7 +205,7 @@ if __name__=="__main__":
             "learning_rate": 2.5 * 1e-5,
             "architecture": "DiffusionDet",
             "dataset": "COCO2017",
-            "N_train": 300,
+            "N_train": 500,
             "Hidden Dimension": 256,
             "epochs": 50,
         },
@@ -223,18 +224,24 @@ if __name__=="__main__":
     ckpt_path = os.path.join(ckpt_dir,"last.pth")
     if os.path.isfile(ckpt_path):
         ckpt = torch.load(ckpt_path,map_location=device)
-        decode.load_state_dict(ckpt["decoder"])
+        dec_state = ckpt["decoder"]
+        dec_state = {k: v for k, v in dec_state.items() if not k.startswith("fc_cls.")}
+        missing, unexpected = decode.load_state_dict(dec_state, strict=False)
+        print("decoder loaded - missing:", missing, "unexpected:", unexpected)
+        decode.fc_cls.reset_parameters()
         encode.load_state_dict(ckpt["encoder"])
         diffusion.load_state_dict(ckpt["diffusion"])
+        '''
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
+        '''
         start_epoch = ckpt.get("epoch",-1) + 1
         best_loss = ckpt.get("epoch_loss", float("inf"))
         global_step = ckpt.get("global_step")
     
     
-    #start_epoch = 0
-    #global_step = 0
+    start_epoch = 0
+    global_step = 0
     torch.autograd.set_detect_anomaly(True)
     for ep in range(start_epoch,epochs):
         print(f"Starting epoch {ep+1}/{epochs}")
@@ -289,7 +296,6 @@ if __name__=="__main__":
             "encoder": encode.state_dict(),
             "diffusion": diffusion.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch_loss": epoch_loss,
             "global_step": global_step
