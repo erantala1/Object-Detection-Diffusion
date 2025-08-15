@@ -99,7 +99,7 @@ def train_loss(images, gt_boxes, gt_labels, sizes, diffusion, encode, decode, cr
 
 
 if __name__=="__main__":
-    ROOT = "/Users/evanrantala/Downloads/COCO/coco2017"
+    ROOT = "./data"
     TRAIN_IMG_DIR = os.path.join(ROOT, "train2017")
     VAL_IMG_DIR   = os.path.join(ROOT, "val2017")
     TRAIN_ANN = os.path.join(ROOT, "annotations", "instances_train2017.json")
@@ -183,9 +183,14 @@ if __name__=="__main__":
     decode.train()
     learning_rate = 2.5 * 1e-5
     optimizer = torch.optim.AdamW(decode.parameters(), lr = learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=5)
+    steps_per_epoch = len(train_loader)
+    warmup_iters = 5* steps_per_epoch
+
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,
+        schedulers = [torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=0.1,total_iters=warmup_iters),
+        torch.optim.lr_scheduler.StepLR(optimizer,step_size=10*steps_per_epoch,gamma=0.5)], milestones=[warmup_iters])
+
     scale = 2.0 #adjust
     N = 300 #proposal boxes
     epochs = 50
@@ -214,7 +219,7 @@ if __name__=="__main__":
     best_loss = float('inf')
     patience = 10
     patience_counter = 0
-    '''
+    
     ckpt_path = os.path.join(ckpt_dir,"last.pth")
     if os.path.isfile(ckpt_path):
         ckpt = torch.load(ckpt_path,map_location=device)
@@ -223,16 +228,13 @@ if __name__=="__main__":
         diffusion.load_state_dict(ckpt["diffusion"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
-        if ckpt.get("warmup_scheduler"):
-            warmup_scheduler.load_state_dict(ckpt["warmup_scheduler"])
-        if scaler and ckpt.get("scaler"):
-            scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt.get("epoch",-1) + 1
         best_loss = ckpt.get("epoch_loss", float("inf"))
         global_step = ckpt.get("global_step")
-    '''
-    start_epoch = 0
-    global_step = 0
+    
+    
+    #start_epoch = 0
+    #global_step = 0
     torch.autograd.set_detect_anomaly(True)
     for ep in range(start_epoch,epochs):
         print(f"Starting epoch {ep+1}/{epochs}")
@@ -254,33 +256,10 @@ if __name__=="__main__":
                 loss, loss_dict = train_loss(images, gt_boxes, gt_labels, sizes, diffusion, encode, decode, criterion, N, scale, T, device)
                 
             print(loss)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(decode.parameters(), max_norm=1.0)
             
-            if use_amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(decode.parameters(), max_norm=1.0)
-
-                total_norm = 0
-                for p in decode.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** (1. / 2)
-                
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(decode.parameters(), max_norm=1.0)
-
-                total_norm = 0
-                for p in decode.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** (1. / 2)
-                
-                optimizer.step()
+            optimizer.step()
             run.log({
                 "global_step": global_step,
                 "batch/loss_total": loss.item(),
@@ -288,15 +267,13 @@ if __name__=="__main__":
                 "batch/loss_bbox":  loss_dict["loss_bbox"].item(),
                 "batch/loss_giou":  loss_dict["loss_giou"].item(),
                 "batch/learning_rate": optimizer.param_groups[0]['lr'],
-                "batch/gradient_norm": total_norm,
             })
 
             global_step += 1
             running_loss += loss.item()
             num_batches += 1
 
-            if ep < 5:
-                warmup_scheduler.step()
+            scheduler.step()
         epoch_loss = (running_loss/num_batches)
         print(f"epoch:{ep}, running_loss = {running_loss}")
         print(f"epoch:{ep}, epoch_loss = {epoch_loss}")
@@ -313,8 +290,7 @@ if __name__=="__main__":
             "diffusion": diffusion.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "warmup_scheduler": warmup_scheduler.state_dict(),
-            "scaler": scaler.state_dict() if scaler else None,
+            "scheduler": scheduler.state_dict(),
             "epoch_loss": epoch_loss,
             "global_step": global_step
             }
@@ -333,16 +309,17 @@ if __name__=="__main__":
         decode.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for images, gt_boxes, gt_labels in val_loader:
+            for images, gt_boxes, gt_labels, sizes in val_loader:
                 images = images.to(device)
                 gt_boxes = gt_boxes.to(device)
                 gt_labels = gt_labels.to(device)
+                sizes = sizes.to(device)
 
                 if torch.isnan(images).any() or torch.isnan(gt_boxes).any():
                     print("Warning: NaN detected in validation data, skipping batch")
                     continue
                     
-                loss, loss_dict = train_loss(images, gt_boxes, gt_labels, diffusion, encode, decode, criterion, N, scale, T, device)
+                loss, loss_dict = train_loss(images, gt_boxes, gt_labels, sizes, diffusion, encode, decode, criterion, N, scale, T, device)
                 val_loss += loss.item()
         
         val_loss = val_loss / len(val_loader)
