@@ -121,6 +121,7 @@ if __name__=="__main__":
     cat_ids = sorted(train_ds.coco.getCatIds())
     cat_id_to_contig = {cid: i for i, cid in enumerate(cat_ids)}
     num_classes = len(cat_ids)
+    print(f"num_classes:{num_classes}")
 
     def collate(batch):
         imgs, box_tensors, label_tensors, sizes = [], [], [], []
@@ -171,6 +172,7 @@ if __name__=="__main__":
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda') if use_amp else None
     num_classes = 80
+    num_classes = 80
     roi_size = 7
     hidden_dim = 256
     diffusion = Diffusion(T,device).to(device)
@@ -193,6 +195,7 @@ if __name__=="__main__":
         torch.optim.lr_scheduler.StepLR(optimizer,step_size=10*steps_per_epoch,gamma=0.5)], milestones=[warmup_iters])
 
     scale = 2.0 #adjust
+    N = 500 #proposal boxes
     N = 500 #proposal boxes
     epochs = 50
     run = wandb.init(
@@ -220,6 +223,7 @@ if __name__=="__main__":
     best_loss = float('inf')
     patience = 10
     patience_counter = 0
+    
     
     ckpt_path = os.path.join(ckpt_dir,"last.pth")
     if os.path.isfile(ckpt_path):
@@ -273,6 +277,7 @@ if __name__=="__main__":
                 "batch/loss_ce":    loss_dict["loss_ce"].item(),
                 "batch/loss_bbox":  loss_dict["loss_bbox"].item(),
                 "batch/loss_giou":  loss_dict["loss_giou"].item(),
+                "batch/matched_frac": loss_dict["matched_frac"].item(),
                 "batch/matched_frac": loss_dict["matched_frac"].item(),
                 "batch/learning_rate": optimizer.param_groups[0]['lr'],
             })

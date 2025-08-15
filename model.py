@@ -285,18 +285,18 @@ class MatcherDynamicK(torch.nn.Module):
 
         indices = []
         for b in range(B):
-            p_xyxy = pred_xyxy[b]                  # [N,4] px
-            p_prob = probs[b]                      # [N,C]
+            p_xyxy = pred_xyxy[b]
+            p_prob = probs[b]
             tgt    = targets[b]
-            gt_ids = tgt["labels"]                 # [M]
+            gt_ids = tgt["labels"]
             M = gt_ids.numel()
             if M == 0:
                 sel = torch.zeros(N, dtype=torch.bool, device=p_prob.device)
                 indices.append((sel, torch.arange(0, device=p_prob.device)))
                 continue
 
-            gt_xyxy = tgt["boxes_xyxy"]            # [M,4] px
-            # classification cost
+            gt_xyxy = tgt["boxes_xyxy"]
+
             if self.use_focal:
                 alpha, gamma = 0.25, 2.0
                 pos = p_prob[:, gt_ids]
@@ -306,31 +306,27 @@ class MatcherDynamicK(torch.nn.Module):
             else:
                 cost_class = -p_prob[:, gt_ids]
 
-            # bbox L1 cost (normalized)
-            img_wh = tgt["image_size_xyxy"]  # [4] = [W,H,W,H]
+            img_wh = tgt["image_size_xyxy"]
             p_xyxy_n = p_xyxy / img_wh
             g_xyxy_n = gt_xyxy / tgt["image_size_xyxy_tgt"]
             cost_bbox = torch.cdist(p_xyxy_n, g_xyxy_n, p=1)
 
-            # giou cost (absolute)
-            giou = ops.generalized_box_iou(p_xyxy, gt_xyxy)  # [N,M]
+            giou = ops.generalized_box_iou(p_xyxy, gt_xyxy)
             cost_giou = 1.0 - giou
 
-            cost = self.cost_class*cost_class + self.cost_bbox*cost_bbox + self.cost_giou*cost_giou  # [N,M]
+            cost = self.cost_class*cost_class + self.cost_bbox*cost_bbox + self.cost_giou*cost_giou
 
-            # simOTA dynamic-K
             with torch.no_grad():
-                pair_ious = ops.box_iou(p_xyxy, gt_xyxy)     # IoU [N,M]
+                pair_ious = ops.box_iou(p_xyxy, gt_xyxy)
                 topk = min(self.ota_k, max(1, N))
-                topk_ious, _ = torch.topk(pair_ious, k=topk, dim=0)   # [topk, M]
-                dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)  # [M]
+                topk_ious, _ = torch.topk(pair_ious, k=topk, dim=0)
+                dynamic_ks = torch.clamp(topk_ious.sum(0).int(), min=1)
 
             matching_matrix = torch.zeros_like(cost)
             for j in range(M):
                 _, pos_idx = torch.topk(cost[:, j], k=dynamic_ks[j].item(), largest=False)
                 matching_matrix[pos_idx, j] = 1.0
 
-            # ensure one-to-many but at least one per GT
             anchor_match_gt = matching_matrix.sum(1)
             if (anchor_match_gt > 1).any():
                 multi = anchor_match_gt > 1
@@ -338,7 +334,6 @@ class MatcherDynamicK(torch.nn.Module):
                 matching_matrix[multi] *= 0
                 matching_matrix[multi, min_cost_idx] = 1
 
-            # if any GT unmatched, force best
             while (matching_matrix.sum(0) == 0).any():
                 un = (matching_matrix.sum(0) == 0).nonzero(as_tuple=False).squeeze(1)
                 for j in un:
@@ -369,19 +364,23 @@ class SetCriterionDynamicKLite(torch.nn.Module):
         B, N, C = outputs["pred_logits"].shape
         indices, _ = self.matcher(outputs, targets)
 
-        # --- classification loss (focal) ---
-        logits = outputs["pred_logits"]        # [B,N,C]
+        matched_pos = 0
+        total_queries = 0
+
+        logits = outputs["pred_logits"]
         probs  = logits_to_probs(logits, use_focal=self.use_focal)
 
         loss_ce_sum = torch.tensor(0., device=logits.device)
         num_pos = 0
         for b in range(B):
-            sel, gt_idx = indices[b]          # sel:[N] bool, gt_idx:[K]
+            sel, gt_idx = indices[b]
+            matched_pos += sel.sum().item()
+            total_queries += sel.numel()
             if gt_idx.numel() == 0:
                 continue
-            tgt_cls = targets[b]["labels"][gt_idx]     # [K] long in [0..C-1]
-            pred_k  = logits[b][sel]                   # [K,C]
-            # focal on positive class positions only (one-hot)
+            tgt_cls = targets[b]["labels"][gt_idx]
+            pred_k  = logits[b][sel]
+
             onehot = torch.zeros_like(pred_k)
             onehot[torch.arange(tgt_cls.numel(), device=logits.device), tgt_cls] = 1.0
             loss_ce = sigmoid_focal_loss(pred_k, onehot, reduction="sum")
@@ -389,31 +388,30 @@ class SetCriterionDynamicKLite(torch.nn.Module):
             num_pos += tgt_cls.numel()
         loss_ce = loss_ce_sum / max(num_pos, 1)
 
-        # --- box losses ---
         loss_l1_sum = torch.tensor(0., device=logits.device)
         loss_gi_sum = torch.tensor(0., device=logits.device)
         for b in range(B):
             sel, gt_idx = indices[b]
             if gt_idx.numel() == 0:
                 continue
-            p_xyxy = outputs["pred_boxes"][b][sel]           # [K,4] px
-            g_xyxy = targets[b]["boxes_xyxy"][gt_idx]        # [K,4] px
+            p_xyxy = outputs["pred_boxes"][b][sel]
+            g_xyxy = targets[b]["boxes_xyxy"][gt_idx]
 
-            # normalized L1 on xyxy (like paper)
-            wh_out = targets[b]["image_size_xyxy"]           # [W,H,W,H]
+            wh_out = targets[b]["image_size_xyxy"] 
             wh_tgt = targets[b]["image_size_xyxy_tgt"]
             p_n = p_xyxy / wh_out
             g_n = g_xyxy / wh_tgt
             loss_l1_sum += F.l1_loss(p_n, g_n, reduction='sum')
 
-            giou = ops.generalized_box_iou(p_xyxy, g_xyxy)   # [K,K]
+            giou = ops.generalized_box_iou(p_xyxy, g_xyxy)
             loss_gi_sum += (1.0 - giou.diag()).sum()
 
         num_pos = max(num_pos, 1)
+        matched_frac = float(matched_pos) / max(total_queries, 1)
         losses = {
             "loss_ce":   loss_ce,
             "loss_bbox": loss_l1_sum / num_pos,
             "loss_giou": loss_gi_sum / num_pos,
+            "matched_frac": torch.as_tensor(matched_frac, device=logits.device),
         }
-        # total (weighted) is computed in train loop
         return losses
