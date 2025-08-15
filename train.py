@@ -193,7 +193,7 @@ if __name__=="__main__":
         torch.optim.lr_scheduler.StepLR(optimizer,step_size=10*steps_per_epoch,gamma=0.5)], milestones=[warmup_iters])
 
     scale = 2.0 #adjust
-    N = 300 #proposal boxes
+    N = 500 #proposal boxes
     epochs = 50
     run = wandb.init(
         # Set the wandb entity where your project will be logged (generally your team name).
@@ -273,6 +273,7 @@ if __name__=="__main__":
                 "batch/loss_ce":    loss_dict["loss_ce"].item(),
                 "batch/loss_bbox":  loss_dict["loss_bbox"].item(),
                 "batch/loss_giou":  loss_dict["loss_giou"].item(),
+                "batch/matched_frac": loss_dict["matched_frac"].item(),
                 "batch/learning_rate": optimizer.param_groups[0]['lr'],
             })
 
